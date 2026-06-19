@@ -11,19 +11,22 @@ CHAT_ID        = "8910984306"
 # ─────────────────────────────────────────
 # SETTINGS
 # ─────────────────────────────────────────
-CHECK_EVERY    = 900   # check every 15 minutes
-MIN_CANDLES    = 5
-STOP_LOSS      = 5
-TAKE_PROFIT    = 10
-RSI_PERIOD     = 14
-SWING_LOOKBACK = 3
+CHECK_EVERY    = 900   # 15 minutes
 GAP_THRESHOLD  = 2.0
+SWING_LOOKBACK = 3
 
 SESSIONS = [
     {"name": "Tokyo",    "start": 0,  "end": 9},
     {"name": "London",   "start": 7,  "end": 16},
     {"name": "New York", "start": 12, "end": 21},
 ]
+
+# Trade type settings
+TRADE_SETTINGS = {
+    "SCALP":     {"tp": 5,  "sl": 3,  "label": "Scalp  (15min)"},
+    "DAY":       {"tp": 15, "sl": 7,  "label": "Day Trade (1hr)"},
+    "SWING":     {"tp": 30, "sl": 10, "label": "Swing (4hr+)"},
+}
 
 # ─────────────────────────────────────────
 # TELEGRAM
@@ -37,7 +40,7 @@ def send_telegram(message):
         print(f"Telegram error: {e}")
 
 # ─────────────────────────────────────────
-# SESSION CHECK
+# SESSION
 # ─────────────────────────────────────────
 def is_trading_session():
     utc_hour = datetime.now(timezone.utc).hour
@@ -46,18 +49,12 @@ def is_trading_session():
             return True, session["name"]
     return False, None
 
-def is_monday():
-    return datetime.now(timezone.utc).weekday() == 0
-
-def is_friday():
-    return datetime.now(timezone.utc).weekday() == 4
+def is_monday(): return datetime.now(timezone.utc).weekday() == 0
+def is_friday(): return datetime.now(timezone.utc).weekday() == 4
 
 # ─────────────────────────────────────────
-# GOLD PRICE
+# GET GOLD PRICE
 # ─────────────────────────────────────────
-candle_history   = []
-last_candle_time = None
-
 def get_gold_price():
     try:
         url = "https://api.coinbase.com/v2/prices/XAU-USD/spot"
@@ -67,171 +64,224 @@ def get_gold_price():
         print(f"Gold price error: {e}")
         return None
 
-def build_candle(price):
-    global candle_history, last_candle_time
-    now           = datetime.now(timezone.utc)
-    candle_minute = (now.minute // 15) * 15  # 15-min candles
-    candle_time   = now.replace(minute=candle_minute, second=0, microsecond=0)
+# ─────────────────────────────────────────
+# CANDLE BUILDER — multiple timeframes
+# ─────────────────────────────────────────
+candles_15m = []
+candles_1h  = []
+candles_4h  = []
+last_15m_time = last_1h_time = last_4h_time = None
 
-    if last_candle_time is None or candle_time != last_candle_time:
-        candle_history.append({
-            "open":  price,
-            "high":  price,
-            "low":   price,
-            "close": price
-        })
-        last_candle_time = candle_time
+def build_candles(price):
+    global candles_15m, candles_1h, candles_4h
+    global last_15m_time, last_1h_time, last_4h_time
+    now = datetime.now(timezone.utc)
+
+    # 15-minute candles
+    t15 = now.replace(minute=(now.minute // 15) * 15, second=0, microsecond=0)
+    if last_15m_time is None or t15 != last_15m_time:
+        candles_15m.append({"open": price, "high": price, "low": price, "close": price})
+        last_15m_time = t15
     else:
-        c = candle_history[-1]
-        c["high"]  = max(c["high"], price)
-        c["low"]   = min(c["low"],  price)
+        c = candles_15m[-1]
+        c["high"] = max(c["high"], price)
+        c["low"]  = min(c["low"],  price)
         c["close"] = price
+    if len(candles_15m) > 100: candles_15m.pop(0)
 
-    if len(candle_history) > 100:
-        candle_history.pop(0)
+    # 1-hour candles
+    t1h = now.replace(minute=0, second=0, microsecond=0)
+    if last_1h_time is None or t1h != last_1h_time:
+        candles_1h.append({"open": price, "high": price, "low": price, "close": price})
+        last_1h_time = t1h
+    else:
+        c = candles_1h[-1]
+        c["high"] = max(c["high"], price)
+        c["low"]  = min(c["low"],  price)
+        c["close"] = price
+    if len(candles_1h) > 100: candles_1h.pop(0)
 
-    return candle_history
+    # 4-hour candles
+    t4h = now.replace(hour=(now.hour // 4) * 4, minute=0, second=0, microsecond=0)
+    if last_4h_time is None or t4h != last_4h_time:
+        candles_4h.append({"open": price, "high": price, "low": price, "close": price})
+        last_4h_time = t4h
+    else:
+        c = candles_4h[-1]
+        c["high"] = max(c["high"], price)
+        c["low"]  = min(c["low"],  price)
+        c["close"] = price
+    if len(candles_4h) > 100: candles_4h.pop(0)
 
 # ─────────────────────────────────────────
-# RSI
-# ─────────────────────────────────────────
-def calculate_rsi(candles):
-    if len(candles) < RSI_PERIOD + 1:
-        return 50.0
-    closes = [c["close"] for c in candles]
-    gains, losses = [], []
-    for i in range(-RSI_PERIOD, 0):
-        diff = closes[i] - closes[i - 1]
-        gains.append(max(diff, 0))
-        losses.append(max(-diff, 0))
-    avg_gain = sum(gains) / RSI_PERIOD
-    avg_loss = sum(losses) / RSI_PERIOD
-    if avg_loss == 0:
-        return 100.0
-    return round(100 - (100 / (1 + avg_gain / avg_loss)), 1)
-
-# ─────────────────────────────────────────
-# SMC INDICATORS — scan multiple candles
+# SMC INDICATORS
 # ─────────────────────────────────────────
 def detect_liquidity(candles):
-    if len(candles) < 6:
-        return None
-    # Scan last 10 candles for any liquidity sweep
-    for i in range(min(10, len(candles)-2), 1, -1):
-        lookback    = candles[-(i+2):-2]
-        if not lookback:
-            continue
-        recent_high = max(c["high"] for c in lookback)
-        recent_low  = min(c["low"]  for c in lookback)
-        prev = candles[-2]
-        last = candles[-1]
-        if prev["high"] > recent_high and last["close"] < prev["close"]:
-            return "BEARISH"
-        elif prev["low"] < recent_low and last["close"] > prev["close"]:
-            return "BULLISH"
+    if len(candles) < 6: return None
+    lookback    = candles[-6:-1]
+    recent_high = max(c["high"] for c in lookback)
+    recent_low  = min(c["low"]  for c in lookback)
+    prev = candles[-2]
+    last = candles[-1]
+    if prev["high"] > recent_high and last["close"] < prev["close"]: return "BEARISH"
+    elif prev["low"] < recent_low and last["close"] > prev["close"]: return "BULLISH"
     return None
 
 def detect_bos(candles):
-    if len(candles) < SWING_LOOKBACK * 2 + 1:
-        return None
-    # Scan multiple swing points
-    for lookback in [3, 5, 7]:
-        if len(candles) < lookback * 2 + 1:
-            continue
-        recent     = candles[-(lookback * 2 + 1):-1]
-        swing_high = max(c["high"] for c in recent)
-        swing_low  = min(c["low"]  for c in recent)
-        last_close = candles[-1]["close"]
-        if last_close > swing_high:  return "BULLISH"
-        elif last_close < swing_low: return "BEARISH"
+    if len(candles) < SWING_LOOKBACK * 2 + 1: return None
+    recent     = candles[-(SWING_LOOKBACK * 2 + 1):-1]
+    swing_high = max(c["high"] for c in recent)
+    swing_low  = min(c["low"]  for c in recent)
+    last_close = candles[-1]["close"]
+    if last_close > swing_high:  return "BULLISH"
+    elif last_close < swing_low: return "BEARISH"
     return None
 
 def detect_fvg(candles):
-    if len(candles) < 3:
-        return None
-    # Scan last 5 candle groups for FVG
-    for i in range(1, min(5, len(candles)-2)):
-        c1 = candles[-(i+2)]
-        c3 = candles[-i]
-        if c1["high"] < c3["low"]:   return "BULLISH"
-        elif c1["low"] > c3["high"]: return "BEARISH"
+    if len(candles) < 3: return None
+    c1 = candles[-3]
+    c3 = candles[-1]
+    if c1["high"] < c3["low"]:   return "BULLISH"
+    elif c1["low"] > c3["high"]: return "BEARISH"
     return None
 
+def get_trend(candles):
+    """Get overall trend from candles"""
+    if len(candles) < 5: return None
+    closes = [c["close"] for c in candles[-5:]]
+    if closes[-1] > closes[0]: return "BULLISH"
+    elif closes[-1] < closes[0]: return "BEARISH"
+    return "NEUTRAL"
+
 # ─────────────────────────────────────────
-# COMBINED SIGNAL
+# MULTI-TIMEFRAME ANALYSIS + TRADE TYPE
 # ─────────────────────────────────────────
-def get_signal(candles, price):
-    liquidity = detect_liquidity(candles)
-    bos       = detect_bos(candles)
-    fvg       = detect_fvg(candles)
-    rsi       = calculate_rsi(candles)
+def analyze_all_timeframes(price):
+    # Get signals from each timeframe
+    liq_15m = detect_liquidity(candles_15m)
+    bos_15m = detect_bos(candles_15m)
+    fvg_15m = detect_fvg(candles_15m)
+    trend_15m = get_trend(candles_15m)
 
-    buy_score = sell_score = 0
+    liq_1h  = detect_liquidity(candles_1h)
+    bos_1h  = detect_bos(candles_1h)
+    fvg_1h  = detect_fvg(candles_1h)
+    trend_1h = get_trend(candles_1h)
 
-    # Liquidity
-    if liquidity == "BULLISH": buy_score  += 2
-    if liquidity == "BEARISH": sell_score += 2
+    liq_4h  = detect_liquidity(candles_4h)
+    bos_4h  = detect_bos(candles_4h)
+    fvg_4h  = detect_fvg(candles_4h)
+    trend_4h = get_trend(candles_4h)
 
-    # BOS
-    if bos == "BULLISH": buy_score  += 2
-    if bos == "BEARISH": sell_score += 2
+    # Score each direction per timeframe
+    buy_15m = sell_15m = buy_1h = sell_1h = buy_4h = sell_4h = 0
 
-    # FVG
-    if fvg == "BULLISH": buy_score  += 1
-    if fvg == "BEARISH": sell_score += 1
+    if liq_15m == "BULLISH": buy_15m  += 1
+    if liq_15m == "BEARISH": sell_15m += 1
+    if bos_15m == "BULLISH": buy_15m  += 1
+    if bos_15m == "BEARISH": sell_15m += 1
+    if fvg_15m == "BULLISH": buy_15m  += 1
+    if fvg_15m == "BEARISH": sell_15m += 1
 
-    # RSI
-    if rsi < 45: buy_score  += 1
-    if rsi > 55: sell_score += 1
+    if liq_1h == "BULLISH": buy_1h  += 1
+    if liq_1h == "BEARISH": sell_1h += 1
+    if bos_1h == "BULLISH": buy_1h  += 1
+    if bos_1h == "BEARISH": sell_1h += 1
+    if fvg_1h == "BULLISH": buy_1h  += 1
+    if fvg_1h == "BEARISH": sell_1h += 1
 
-    # Determine strength
-    if buy_score >= 5:
-        strength = "STRONG"
-        signal = "BUY"
-    elif buy_score >= 3:
-        strength = "MODERATE"
-        signal = "BUY"
-    elif buy_score >= 2:
-        strength = "WEAK"
-        signal = "BUY"
-    elif sell_score >= 5:
-        strength = "STRONG"
-        signal = "SELL"
-    elif sell_score >= 3:
-        strength = "MODERATE"
-        signal = "SELL"
-    elif sell_score >= 2:
-        strength = "WEAK"
-        signal = "SELL"
+    if liq_4h == "BULLISH": buy_4h  += 1
+    if liq_4h == "BEARISH": sell_4h += 1
+    if bos_4h == "BULLISH": buy_4h  += 1
+    if bos_4h == "BEARISH": sell_4h += 1
+    if fvg_4h == "BULLISH": buy_4h  += 1
+    if fvg_4h == "BEARISH": sell_4h += 1
+
+    # Determine direction
+    total_buy  = buy_15m + buy_1h + buy_4h
+    total_sell = sell_15m + sell_1h + sell_4h
+
+    if total_buy < 3 and total_sell < 3:
+        return "HOLD", None, None, trend_15m, trend_1h, trend_4h
+
+    direction = "BUY" if total_buy > total_sell else "SELL"
+
+    # Determine trade type based on timeframe alignment
+    # All 3 timeframes agree = SWING
+    # 2 timeframes agree = DAY TRADE
+    # Only 15min = SCALP
+
+    if direction == "BUY":
+        tf_count = sum([
+            1 if buy_15m >= 2 else 0,
+            1 if buy_1h  >= 2 else 0,
+            1 if buy_4h  >= 2 else 0
+        ])
     else:
-        return "HOLD", liquidity, bos, fvg, rsi, None
+        tf_count = sum([
+            1 if sell_15m >= 2 else 0,
+            1 if sell_1h  >= 2 else 0,
+            1 if sell_4h  >= 2 else 0
+        ])
 
-    return signal, liquidity, bos, fvg, rsi, strength
+    if tf_count == 3:
+        trade_type = "SWING"
+    elif tf_count == 2:
+        trade_type = "DAY"
+    else:
+        trade_type = "SCALP"
+
+    return direction, trade_type, tf_count, trend_15m, trend_1h, trend_4h
 
 # ─────────────────────────────────────────
-# MONDAY GAP
+# FRIDAY CLOSE ALERT
 # ─────────────────────────────────────────
-def check_monday_gap(friday_close, monday_open):
-    if friday_close is None or monday_open is None:
-        return None, 0
-    gap      = monday_open - friday_close
-    gap_size = abs(gap)
-    if gap_size < GAP_THRESHOLD:
-        return None, gap_size
-    return "SELL" if gap > 0 else "BUY", gap_size
+def friday_close_alert(price):
+    utc_hour = datetime.now(timezone.utc).hour
+    utc_min  = datetime.now(timezone.utc).minute
+    now      = datetime.now().strftime("%H:%M:%S")
+
+    if utc_hour == 21 and utc_min >= 59:
+        if len(candles_15m) >= 5:
+            ranges    = [c["high"] - c["low"] for c in candles_15m[-5:]]
+            avg_range = sum(ranges) / len(ranges)
+            if avg_range > 15:
+                send_telegram(
+                    f"FRIDAY WARNING!\n"
+                    f"Too volatile — SKIP weekend!\n"
+                    f"Range: ${avg_range:,.2f}\n"
+                    f"Time: {now}"
+                )
+            else:
+                buy_sl  = round(price - 5, 2)
+                sell_sl = round(price + 5, 2)
+                send_telegram(
+                    f"ENTER NOW — 1 MIN TO CLOSE!\n"
+                    f"Gold: ${price:,.2f}\n"
+                    f"Volatility: LOW SAFE!\n"
+                    f"Lot: 0.05\n"
+                    f"-------------------\n"
+                    f"ACCOUNT 1 BUY @ ${price:,.2f}\n"
+                    f"SL: ${buy_sl:,.2f}\n\n"
+                    f"ACCOUNT 2 SELL @ ${price:,.2f}\n"
+                    f"SL: ${sell_sl:,.2f}\n"
+                    f"-------------------\n"
+                    f"Check Monday 1AM Nairobi!\n"
+                    f"Time: {now}"
+                )
 
 # ─────────────────────────────────────────
 # MAIN LOOP
 # ─────────────────────────────────────────
 def main():
-    print("Edgar's Gold Bot Started!")
+    print("Edgar's Multi-Timeframe Gold Bot Started!")
     send_telegram(
         "Hello Edgar!\n"
-        "Gold Bot is now running!\n"
-        "Scanning every 1 minute\n"
-        "15-min candles\n"
-        "Sessions: Tokyo + London + New York\n"
-        "Strategy: SMC + RSI + Monday Gap"
+        "Multi-Timeframe Gold Bot is LIVE!\n"
+        "Strategy: SMC — Liquidity + BOS + FVG\n"
+        "Timeframes: 15min + 1hr + 4hr\n"
+        "Auto detects: Scalp / Day / Swing\n"
+        "Sessions: Tokyo + London + New York"
     )
 
     in_trade              = False
@@ -239,267 +289,128 @@ def main():
     entry_price           = None
     tp_price              = None
     sl_price              = None
+    last_signal           = None
     last_session_notified = None
     friday_close          = None
     gap_traded_today      = False
-    last_signal           = None
 
     while True:
         now     = datetime.now().strftime("%H:%M:%S")
         trading, session_name = is_trading_session()
-        today_is_monday = is_monday()
-        today_is_friday = is_friday()
 
-        print(f"\n[{now}] Session: {session_name or 'CLOSED'}")
+        price = get_gold_price()
+        if price:
+            build_candles(price)
+            print(f"[{now}] Gold: ${price:,.2f} | 15m:{len(candles_15m)} 1h:{len(candles_1h)} 4h:{len(candles_4h)}")
 
-        # Friday close alert + volatility check
-        if today_is_friday:
-            price = get_gold_price()
-            if price:
-                friday_close = price
-                print(f"Friday close: ${friday_close:,.2f}")
-                if len(candle_history) >= 5:
-                    friday_close_alert(candle_history, price)
+        # Friday alert
+        if is_friday() and price:
+            friday_close = price
+            friday_close_alert(price)
 
-        # Monday gap check
-        if today_is_monday and not gap_traded_today and friday_close:
-            price = get_gold_price()
-            if price:
-                gap_signal, gap_size = check_monday_gap(friday_close, price)
-                if gap_signal and not in_trade:
-                    entry_price = price
-                    tp_price    = round(friday_close, 2)
-                    sl_price    = round(price - STOP_LOSS, 2) if gap_signal == "BUY" else round(price + STOP_LOSS, 2)
-                    trade_type  = gap_signal
-                    in_trade    = True
-                    gap_traded_today = True
-                    send_telegram(
-                        f"MONDAY GAP — {gap_signal}\n"
-                        f"-------------------\n"
-                        f"Gap Size:     ${gap_size:,.2f}\n"
-                        f"Friday Close: ${friday_close:,.2f}\n"
-                        f"Entry:        ${entry_price:,.2f}\n"
-                        f"Take Profit:  ${tp_price:,.2f}\n"
-                        f"Stop Loss:    ${sl_price:,.2f}\n"
-                        f"Win Rate: ~85%\n"
-                        f"Time: {now}"
-                    )
+        # Monday gap
+        if is_monday() and not gap_traded_today and friday_close and price:
+            gap      = price - friday_close
+            gap_size = abs(gap)
+            if gap_size >= GAP_THRESHOLD and not in_trade:
+                gap_signal  = "SELL" if gap > 0 else "BUY"
+                entry_price = price
+                tp_price    = round(friday_close, 2)
+                sl_price    = round(price - 5, 2) if gap_signal == "BUY" else round(price + 5, 2)
+                trade_type  = "GAP"
+                in_trade    = True
+                gap_traded_today = True
+                send_telegram(
+                    f"MONDAY GAP — {gap_signal}\n"
+                    f"Gap Size: ${gap_size:,.2f}\n"
+                    f"Friday Close: ${friday_close:,.2f}\n"
+                    f"Entry: ${entry_price:,.2f}\n"
+                    f"TP: ${tp_price:,.2f}\n"
+                    f"SL: ${sl_price:,.2f}\n"
+                    f"Win Rate: ~85%\n"
+                    f"Time: {now}"
+                )
 
         if datetime.now(timezone.utc).weekday() == 1:
             gap_traded_today = False
 
         # Session notifications
         if trading and session_name != last_session_notified:
-            send_telegram(f"Session Open!\n{session_name} Session active\nScanning every minute...")
+            send_telegram(f"Session Open!\n{session_name} active\nScanning 15min + 1hr + 4hr...")
             last_session_notified = session_name
-
         if not trading and last_session_notified is not None:
             send_telegram("Sessions Closed!\nBot resumes next session.")
             last_session_notified = None
 
-        # Get price and build candle
-        price = get_gold_price()
-        if not price:
+        if not trading:
             time.sleep(CHECK_EVERY)
             continue
 
-        candles = build_candle(price)
-        print(f"Gold: ${price:,.2f} | Candles: {len(candles)}")
+        if not price or len(candles_15m) < 5:
+            time.sleep(CHECK_EVERY)
+            continue
+
+        last_high = candles_15m[-1]["high"]
+        last_low  = candles_15m[-1]["low"]
 
         # Monitor trade
         if in_trade:
-            print(f"In {trade_type} | TP: ${tp_price} | SL: ${sl_price}")
-            if trade_type == "BUY":
-                if price >= tp_price:
-                    send_telegram(f"TAKE PROFIT HIT!\n-------------------\nEntry:  ${entry_price:,.2f}\nExit:   ${tp_price:,.2f}\nProfit: +${abs(tp_price-entry_price):,.2f}\nTime: {now}")
+            print(f"In {trade_type} {trade_type} | TP: ${tp_price} | SL: ${sl_price}")
+            if trade_type in ["BUY", "GAP"]:
+                if last_high >= tp_price:
+                    send_telegram(f"TAKE PROFIT HIT!\nEntry: ${entry_price:,.2f}\nExit: ${tp_price:,.2f}\nProfit: +${abs(tp_price-entry_price):,.2f}\nTime: {now}")
                     in_trade = False
-                elif price <= sl_price:
-                    send_telegram(f"STOP LOSS HIT!\n-------------------\nEntry: ${entry_price:,.2f}\nExit:  ${sl_price:,.2f}\nLoss:  -${STOP_LOSS}\nTime: {now}")
+                elif last_low <= sl_price:
+                    send_telegram(f"STOP LOSS HIT!\nEntry: ${entry_price:,.2f}\nExit: ${sl_price:,.2f}\nTime: {now}")
                     in_trade = False
             elif trade_type == "SELL":
-                if price <= tp_price:
-                    send_telegram(f"TAKE PROFIT HIT!\n-------------------\nEntry:  ${entry_price:,.2f}\nExit:   ${tp_price:,.2f}\nProfit: +${abs(entry_price-tp_price):,.2f}\nTime: {now}")
+                if last_low <= tp_price:
+                    send_telegram(f"TAKE PROFIT HIT!\nEntry: ${entry_price:,.2f}\nExit: ${tp_price:,.2f}\nProfit: +${abs(entry_price-tp_price):,.2f}\nTime: {now}")
                     in_trade = False
-                elif price >= sl_price:
-                    send_telegram(f"STOP LOSS HIT!\n-------------------\nEntry: ${entry_price:,.2f}\nExit:  ${sl_price:,.2f}\nLoss:  -${STOP_LOSS}\nTime: {now}")
+                elif last_high >= sl_price:
+                    send_telegram(f"STOP LOSS HIT!\nEntry: ${entry_price:,.2f}\nExit: ${sl_price:,.2f}\nTime: {now}")
                     in_trade = False
 
         # Look for signal
-        if not in_trade and len(candles) >= MIN_CANDLES and trading:
-            signal, liquidity, bos, fvg, rsi, strength = get_signal(candles, price)
-            print(f"Liquidity: {liquidity} | BOS: {bos} | FVG: {fvg} | RSI: {rsi} | {signal} ({strength})")
+        if not in_trade:
+            direction, t_type, tf_count, t15, t1h, t4h = analyze_all_timeframes(price)
+            print(f"Direction: {direction} | Type: {t_type} | TF count: {tf_count}")
+            print(f"Trends — 15m: {t15} | 1h: {t1h} | 4h: {t4h}")
 
-            # Only send if signal changed
-            if signal in ["BUY", "SELL"] and signal != last_signal:
+            if direction in ["BUY", "SELL"] and direction != last_signal:
+                settings    = TRADE_SETTINGS[t_type]
                 entry_price = price
-                if signal == "BUY":
-                    tp_price = round(price + TAKE_PROFIT, 2)
-                    sl_price = round(price - STOP_LOSS, 2)
+                if direction == "BUY":
+                    tp_price = round(price + settings["tp"], 2)
+                    sl_price = round(price - settings["sl"], 2)
                 else:
-                    tp_price = round(price - TAKE_PROFIT, 2)
-                    sl_price = round(price + STOP_LOSS, 2)
-                trade_type = signal
-                in_trade   = True
-                last_signal = signal
+                    tp_price = round(price - settings["tp"], 2)
+                    sl_price = round(price + settings["sl"], 2)
 
-                if strength == "STRONG":     conf = "STRONG"
-                elif strength == "MODERATE": conf = "MODERATE"
-                else:                        conf = "WEAK"
+                trade_type  = direction
+                in_trade    = True
+                last_signal = direction
 
                 send_telegram(
-                    f"GOLD SIGNAL — {signal} ({conf})\n"
+                    f"GOLD SIGNAL — {direction}\n"
+                    f"Trade Type: {settings['label']}\n"
+                    f"Timeframes: {tf_count}/3 aligned\n"
                     f"-------------------\n"
-                    f"Entry:       ${entry_price:,.2f}\n"
-                    f"Take Profit: ${tp_price:,.2f}\n"
-                    f"Stop Loss:   ${sl_price:,.2f}\n"
+                    f"Entry: ${entry_price:,.2f}\n"
+                    f"TP:    ${tp_price:,.2f} (+${settings['tp']})\n"
+                    f"SL:    ${sl_price:,.2f} (-${settings['sl']})\n"
                     f"-------------------\n"
-                    f"Liquidity: {liquidity}\n"
-                    f"BOS:       {bos}\n"
-                    f"FVG:       {fvg}\n"
-                    f"RSI:       {rsi}\n"
+                    f"15min trend: {t15}\n"
+                    f"1hr trend:   {t1h}\n"
+                    f"4hr trend:   {t4h}\n"
                     f"Session: {session_name}\n"
                     f"Time: {now}"
                 )
-            elif signal == "HOLD":
+            elif direction == "HOLD":
                 last_signal = None
 
         time.sleep(CHECK_EVERY)
 
 if __name__ == "__main__":
     main()
-
-
-# ─────────────────────────────────────────
-# GAP PREDICTION
-# Analyzes Friday price action to predict
-# if a Monday gap is likely
-# ─────────────────────────────────────────
-def predict_gap(candles, price):
-    if len(candles) < 10:
-        return "Unknown", "Not enough data"
-
-    closes  = [c["close"] for c in candles[-10:]]
-    highs   = [c["high"]  for c in candles[-10:]]
-    lows    = [c["low"]   for c in candles[-10:]]
-
-    # Overall Friday trend
-    trend        = closes[-1] - closes[0]
-    weekly_range = max(highs) - min(lows)
-    momentum     = closes[-1] - closes[-3]  # last 3 candles momentum
-
-    score     = 0
-    direction = "UNKNOWN"
-    reasons   = []
-
-    # Strong uptrend on Friday = gap up likely
-    if trend > 5:
-        score += 2
-        direction = "UP"
-        reasons.append(f"Strong Friday uptrend (+${trend:,.2f})")
-    elif trend < -5:
-        score += 2
-        direction = "DOWN"
-        reasons.append(f"Strong Friday downtrend (${trend:,.2f})")
-
-    # Strong momentum in last 3 candles
-    if momentum > 3:
-        score += 1
-        direction = "UP"
-        reasons.append(f"Bullish momentum (+${momentum:,.2f})")
-    elif momentum < -3:
-        score += 1
-        direction = "DOWN"
-        reasons.append(f"Bearish momentum (${momentum:,.2f})")
-
-    # Wide weekly range = volatile week = gap more likely
-    if weekly_range > 20:
-        score += 1
-        reasons.append(f"Wide weekly range (${weekly_range:,.2f})")
-
-    # Closing near highs = gap up likely
-    week_high = max(highs)
-    week_low  = min(lows)
-    if price > week_high * 0.998:
-        score += 1
-        direction = "UP"
-        reasons.append("Closing near weekly highs")
-    elif price < week_low * 1.002:
-        score += 1
-        direction = "DOWN"
-        reasons.append("Closing near weekly lows")
-
-    # Determine prediction
-    if score >= 3 and direction == "UP":
-        prediction  = "GAP UP LIKELY"
-        confidence  = "HIGH" if score >= 4 else "MODERATE"
-        action      = "SELL account likely to WIN Monday"
-    elif score >= 3 and direction == "DOWN":
-        prediction  = "GAP DOWN LIKELY"
-        confidence  = "HIGH" if score >= 4 else "MODERATE"
-        action      = "BUY account likely to WIN Monday"
-    else:
-        prediction  = "GAP DIRECTION UNCLEAR"
-        confidence  = "LOW"
-        action      = "Both trades valid — gap could go either way"
-
-    return prediction, confidence, action, reasons
-
-# ─────────────────────────────────────────
-# FRIDAY CLOSE ALERT + VOLATILITY CHECKER
-# ─────────────────────────────────────────
-def check_friday_volatility(candles):
-    if len(candles) < 5:
-        return None, None
-    # Get last 5 candles high-low range
-    ranges = [c["high"] - c["low"] for c in candles[-5:]]
-    avg_range = sum(ranges) / len(ranges)
-    last_price = candles[-1]["close"]
-    return avg_range, last_price
-
-def friday_close_alert(candles, price):
-    avg_range, last_price = check_friday_volatility(candles)
-    if avg_range is None:
-        return
-
-    now = datetime.now().strftime("%H:%M:%S")
-    utc_hour = datetime.now(timezone.utc).hour
-    utc_min  = datetime.now(timezone.utc).minute
-
-    # Alert at 9:59 PM UTC (1 min before market close)
-    if utc_hour == 21 and utc_min >= 59:
-        if avg_range > 15:
-            # Too volatile — warn Edgar
-            send_telegram(
-                f"⚠️ FRIDAY VOLATILITY WARNING!\n"
-                f"-------------------\n"
-                f"Gold is moving too much!\n"
-                f"Average candle range: ${avg_range:,.2f}\n"
-                f"Current price: ${price:,.2f}\n"
-                f"-------------------\n"
-                f"RECOMMENDATION: Skip this weekend\n"
-                f"Too risky to enter both trades!\n"
-                f"Wait for calmer Friday next week.\n"
-                f"Time: {now}"
-            )
-        else:
-            # Safe to enter — give exact levels
-            buy_sl  = round(price - 5, 2)
-            sell_sl = round(price + 5, 2)
-            send_telegram(
-                f"✅ FRIDAY CLOSE ALERT!\n"
-                f"Market closes in 5 minutes!\n"
-                f"-------------------\n"
-                f"Gold Price: ${price:,.2f}\n"
-                f"Volatility: LOW — SAFE TO ENTER!\n"
-                f"-------------------\n"
-                f"ACCOUNT 1 — BUY 0.05 lots\n"
-                f"Entry: ${price:,.2f}\n"
-                f"No TP | SL: ${buy_sl:,.2f}\n\n"
-                f"ACCOUNT 2 — SELL 0.05 lots\n"
-                f"Entry: ${price:,.2f}\n"
-                f"No TP | SL: ${sell_sl:,.2f}\n"
-                f"-------------------\n"
-                f"Check Monday 1AM Nairobi\n"
-                f"for gap direction!\n"
-                f"Time: {now}"
-            )
+    
