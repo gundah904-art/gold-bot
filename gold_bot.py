@@ -34,7 +34,10 @@ TRADE_SETTINGS = {
     "DAY":   {"tp": 15, "sl": 7,  "lot": 0.02, "label": "Day Trade (1hr)"},
     "SWING": {"tp": 30, "sl": 10, "lot": 0.03, "label": "Swing (4hr+)"},
     "GAP":   {"tp": 0,  "sl": 5,  "lot": 0.05, "label": "Monday Gap"},
+    "ZONE":  {"tp": 15, "sl": 6,  "lot": 0.02, "label": "Demand/Supply Zone"},
 }
+
+ZONE_TOUCH_DISTANCE = 3.0   # price must be within $3 of a zone to trigger
 
 # ─────────────────────────────────────────
 # TELEGRAM
@@ -198,6 +201,27 @@ def find_zones(candles, lookback=ZONE_LOOKBACK):
     return support, resistance, demand_zone, supply_zone
 
 # ─────────────────────────────────────────
+# ZONE TRADING SIGNAL (separate from SMC)
+# Trades ONLY based on price reacting at a
+# demand zone (BUY) or supply zone (SELL).
+# Independent of Liquidity/BOS/FVG signal.
+# ─────────────────────────────────────────
+def get_zone_signal(price):
+    support, resistance, demand, supply = find_zones(candles_1h)
+
+    # Prefer demand/supply zones over plain support/resistance
+    buy_level  = demand  if demand  else support
+    sell_level = supply  if supply  else resistance
+
+    if buy_level and abs(price - buy_level) <= ZONE_TOUCH_DISTANCE:
+        return "BUY", buy_level, support, resistance, demand, supply
+    if sell_level and abs(price - sell_level) <= ZONE_TOUCH_DISTANCE:
+        return "SELL", sell_level, support, resistance, demand, supply
+
+    return None, None, support, resistance, demand, supply
+
+
+# ─────────────────────────────────────────
 # MULTI-TIMEFRAME ANALYSIS
 # ─────────────────────────────────────────
 def analyze_all_timeframes(price):
@@ -214,14 +238,14 @@ def analyze_all_timeframes(price):
     sell_4h  = sum([liq_4h=="BEARISH", bos_4h=="BEARISH", fvg_4h=="BEARISH"])
 
     total_buy, total_sell = buy_15m+buy_1h+buy_4h, sell_15m+sell_1h+sell_4h
-    if total_buy < 3 and total_sell < 3:
+    if total_buy < 2 and total_sell < 2:
         return "HOLD", None, None, trend_15m, trend_1h, trend_4h
 
     direction = "BUY" if total_buy > total_sell else "SELL"
     if direction == "BUY":
-        tf_count = sum([buy_15m>=2, buy_1h>=2, buy_4h>=2])
+        tf_count = sum([buy_15m>=1, buy_1h>=1, buy_4h>=1])
     else:
-        tf_count = sum([sell_15m>=2, sell_1h>=2, sell_4h>=2])
+        tf_count = sum([sell_15m>=1, sell_1h>=1, sell_4h>=1])
 
     trade_type = "SWING" if tf_count==3 else ("DAY" if tf_count==2 else "SCALP")
     return direction, trade_type, tf_count, trend_15m, trend_1h, trend_4h
@@ -305,9 +329,9 @@ def main():
     send_telegram(
         "Hello Edgar!\n"
         "Auto-Trading Gold Bot is LIVE!\n"
-        "Strategy: SMC - Liquidity + BOS + FVG\n"
-        "Timeframes: 15min + 1hr + 4hr\n"
-        "Now marking Support/Resistance + Supply/Demand zones!\n"
+        "Running 2 INDEPENDENT strategies:\n"
+        "1. SMC Signal - Liquidity + BOS + FVG (15m/1h/4h)\n"
+        "2. Zone Signal - Demand/Supply zone reaction\n"
         "Trades placed AUTOMATICALLY on Just Markets!\n"
         f"Account: {MT_LOGIN} ({MT_SERVER})\n"
         "Sessions: Tokyo + London + New York"
@@ -316,7 +340,8 @@ def main():
     in_trade = False
     trade_type = None
     entry_price = tp_price = sl_price = None
-    last_signal = None
+    last_smc_signal = None
+    last_zone_signal = None
     last_session_notified = None
     friday_close = None
     gap_traded_today = False
@@ -387,31 +412,83 @@ def main():
                     in_trade = False
 
         if not in_trade:
-            direction, t_type, tf_count, t15, t1h, t4h = analyze_all_timeframes(price)
-            print(f"Direction: {direction} | Type: {t_type} | TF: {tf_count}")
+            # ── STRATEGY 1: ZONE SIGNAL (Demand/Supply reaction) ──
+            zone_dir, zone_level, support, resistance, demand, supply = get_zone_signal(price)
+            print(f"Zone check -> {zone_dir} at {zone_level} | Support:{support} Resistance:{resistance} Demand:{demand} Supply:{supply}")
 
-            if direction in ["BUY","SELL"] and direction != last_signal:
-                settings = TRADE_SETTINGS[t_type]
+            if zone_dir in ["BUY", "SELL"] and zone_dir != last_zone_signal:
+                settings = TRADE_SETTINGS["ZONE"]
                 entry_price = price
-                if direction == "BUY":
+                if zone_dir == "BUY":
                     tp_price = round(price + settings["tp"], 2)
                     sl_price = round(price - settings["sl"], 2)
                 else:
                     tp_price = round(price - settings["tp"], 2)
                     sl_price = round(price + settings["sl"], 2)
-                trade_type = direction
+                trade_type = zone_dir
                 in_trade = True
-                last_signal = direction
+                last_zone_signal = zone_dir
 
-                # Find key zones on the 1h candles for context
-                support, resistance, demand, supply = find_zones(candles_1h)
                 zones_text = ""
                 if support:    zones_text += f"Support:    ${support:,.2f}\n"
                 if resistance: zones_text += f"Resistance: ${resistance:,.2f}\n"
                 if demand:     zones_text += f"Demand Zone: ${demand:,.2f}\n"
                 if supply:     zones_text += f"Supply Zone: ${supply:,.2f}\n"
-                if not zones_text:
-                    zones_text = "Not enough data yet\n"
 
                 send_telegram(
-                   
+                    f"ZONE SIGNAL - {zone_dir}\n"
+                    f"Reacted at: ${zone_level:,.2f}\n"
+                    f"-------------------\nEntry: ${entry_price:,.2f}\nTP: ${tp_price:,.2f}\nSL: ${sl_price:,.2f}\n"
+                    f"Lot: {settings['lot']}\n-------------------\n"
+                    f"KEY ZONES:\n{zones_text}"
+                    f"-------------------\nSession: {session_name}\nPlacing trade automatically...\nTime: {now}"
+                )
+                success = place_trade(zone_dir, settings["lot"], tp_price, sl_price)
+                send_telegram(f"TRADE PLACED!\n{zone_dir} XAUUSD @ ${price:,.2f} (Zone trade)" if success else "Auto-trade failed - place manually on Just Markets!")
+
+            elif zone_dir is None:
+                last_zone_signal = None
+
+            # ── STRATEGY 2: SMC SIGNAL (Liquidity + BOS + FVG) ──
+            if not in_trade:
+                direction, t_type, tf_count, t15, t1h, t4h = analyze_all_timeframes(price)
+                print(f"SMC Direction: {direction} | Type: {t_type} | TF: {tf_count}")
+
+                if direction in ["BUY","SELL"] and direction != last_smc_signal:
+                    settings = TRADE_SETTINGS[t_type]
+                    entry_price = price
+                    if direction == "BUY":
+                        tp_price = round(price + settings["tp"], 2)
+                        sl_price = round(price - settings["sl"], 2)
+                    else:
+                        tp_price = round(price - settings["tp"], 2)
+                        sl_price = round(price + settings["sl"], 2)
+                    trade_type = direction
+                    in_trade = True
+                    last_smc_signal = direction
+
+                    zones_text = ""
+                    if support:    zones_text += f"Support:    ${support:,.2f}\n"
+                    if resistance: zones_text += f"Resistance: ${resistance:,.2f}\n"
+                    if demand:     zones_text += f"Demand Zone: ${demand:,.2f}\n"
+                    if supply:     zones_text += f"Supply Zone: ${supply:,.2f}\n"
+                    if not zones_text:
+                        zones_text = "Not enough data yet\n"
+
+                    send_telegram(
+                        f"SMC SIGNAL - {direction}\nTrade Type: {settings['label']}\nTF aligned: {tf_count}/3\n"
+                        f"-------------------\nEntry: ${entry_price:,.2f}\nTP: ${tp_price:,.2f}\nSL: ${sl_price:,.2f}\n"
+                        f"Lot: {settings['lot']}\n-------------------\n"
+                        f"KEY ZONES:\n{zones_text}"
+                        f"-------------------\n15m:{t15} 1h:{t1h} 4h:{t4h}\n"
+                        f"Session: {session_name}\nPlacing trade automatically...\nTime: {now}"
+                    )
+                    success = place_trade(direction, settings["lot"], tp_price, sl_price)
+                    send_telegram(f"TRADE PLACED!\n{direction} XAUUSD @ ${price:,.2f} (SMC trade)" if success else "Auto-trade failed - place manually on Just Markets!")
+                elif direction == "HOLD":
+                    last_smc_signal = None
+
+        time.sleep(CHECK_EVERY)
+
+if __name__ == "__main__":
+    main()
