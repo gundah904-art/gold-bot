@@ -1,1 +1,2 @@
-requests 
+requests
+metaapi-cloud-sdk
