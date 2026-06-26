@@ -1,0 +1,547 @@
+import os
+import csv
+import asyncio
+import requests
+from datetime import datetime, timezone, timedelta
+
+# ─────────────────────────────────────────
+# CREDENTIALS — loaded from Railway environment variables
+# ─────────────────────────────────────────
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+CHAT_ID        = os.environ.get("CHAT_ID")
+METAAPI_TOKEN  = os.environ.get("METAAPI_TOKEN")
+MT_LOGIN       = os.environ.get("MT_LOGIN")
+MT_SERVER      = os.environ.get("MT_SERVER")
+MT_PASSWORD    = os.environ.get("MT_PASSWORD")
+MT_LOGIN2      = os.environ.get("MT_LOGIN2")
+MT_PASSWORD2   = os.environ.get("MT_PASSWORD2")
+
+_required = {
+    "TELEGRAM_TOKEN": TELEGRAM_TOKEN,
+    "CHAT_ID": CHAT_ID,
+    "METAAPI_TOKEN": METAAPI_TOKEN,
+    "MT_LOGIN": MT_LOGIN,
+    "MT_SERVER": MT_SERVER,
+    "MT_PASSWORD": MT_PASSWORD,
+}
+_missing = [k for k, v in _required.items() if not v]
+if _missing:
+    raise RuntimeError(f"Missing required environment variables: {', '.join(_missing)}.")
+
+# ─────────────────────────────────────────
+# SETTINGS
+# ─────────────────────────────────────────
+CHECK_EVERY           = 900
+SWING_LOOKBACK        = 3
+ZONE_LOOKBACK         = 30
+ZONE_TOLERANCE        = 3.0
+AUTO_TRADE            = True
+ORDERS_PER_SIGNAL     = 5
+TRADE_LOG_FILE        = "trade_log.csv"
+WEEKLY_SUMMARY_WEEKDAY = 6
+WEEKLY_SUMMARY_HOUR    = 20
+
+SESSIONS = [
+    {"name": "Tokyo",    "start": 0,  "end": 9},
+    {"name": "London",   "start": 7,  "end": 16},
+    {"name": "New York", "start": 12, "end": 21},
+]
+
+TRADE_SETTINGS = {
+    "SCALP": {"tp": 5,  "sl": 3,  "lot": 0.01, "label": "Scalp (15min)"},
+    "DAY":   {"tp": 15, "sl": 7,  "lot": 0.02, "label": "Day Trade (1hr)"},
+    "SWING": {"tp": 30, "sl": 10, "lot": 0.03, "label": "Swing (4hr+)"},
+    "ZONE":  {"tp": 10, "sl": 5,  "lot": 0.02, "label": "Zone Reaction"},
+}
+
+# ─────────────────────────────────────────
+# TELEGRAM
+# ─────────────────────────────────────────
+def send_telegram(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    try:
+        requests.post(url, data={"chat_id": CHAT_ID, "text": message}, timeout=10)
+        print("Telegram sent!")
+    except Exception as e:
+        print(f"Telegram error: {e}")
+
+# ─────────────────────────────────────────
+# SESSION
+# ─────────────────────────────────────────
+def is_trading_session():
+    utc_hour = datetime.now(timezone.utc).hour
+    for session in SESSIONS:
+        if session["start"] <= utc_hour < session["end"]:
+            return True, session["name"]
+    return False, None
+
+def is_friday(): return datetime.now(timezone.utc).weekday() == 4
+
+# ─────────────────────────────────────────
+# GOLD PRICE
+# ─────────────────────────────────────────
+def get_gold_price():
+    try:
+        url = "https://api.coinbase.com/v2/prices/XAU-USD/spot"
+        response = requests.get(url, timeout=10)
+        return float(response.json()["data"]["amount"])
+    except Exception as e:
+        print(f"Gold price error: {e}")
+        return None
+
+# ─────────────────────────────────────────
+# CANDLE BUILDER
+# ─────────────────────────────────────────
+candles_15m, candles_1h, candles_4h = [], [], []
+last_15m_time = last_1h_time = last_4h_time = None
+
+def build_candles(price):
+    global candles_15m, candles_1h, candles_4h
+    global last_15m_time, last_1h_time, last_4h_time
+    now = datetime.now(timezone.utc)
+
+    t15 = now.replace(minute=(now.minute // 15) * 15, second=0, microsecond=0)
+    if last_15m_time is None or t15 != last_15m_time:
+        candles_15m.append({"open": price, "high": price, "low": price, "close": price})
+        last_15m_time = t15
+    else:
+        c = candles_15m[-1]
+        c["high"] = max(c["high"], price); c["low"] = min(c["low"], price); c["close"] = price
+    if len(candles_15m) > 100: candles_15m.pop(0)
+
+    t1h = now.replace(minute=0, second=0, microsecond=0)
+    if last_1h_time is None or t1h != last_1h_time:
+        candles_1h.append({"open": price, "high": price, "low": price, "close": price})
+        last_1h_time = t1h
+    else:
+        c = candles_1h[-1]
+        c["high"] = max(c["high"], price); c["low"] = min(c["low"], price); c["close"] = price
+    if len(candles_1h) > 100: candles_1h.pop(0)
+
+    t4h = now.replace(hour=(now.hour // 4) * 4, minute=0, second=0, microsecond=0)
+    if last_4h_time is None or t4h != last_4h_time:
+        candles_4h.append({"open": price, "high": price, "low": price, "close": price})
+        last_4h_time = t4h
+    else:
+        c = candles_4h[-1]
+        c["high"] = max(c["high"], price); c["low"] = min(c["low"], price); c["close"] = price
+    if len(candles_4h) > 100: candles_4h.pop(0)
+
+# ─────────────────────────────────────────
+# SMC INDICATORS
+# ─────────────────────────────────────────
+def detect_liquidity(candles):
+    if len(candles) < 6: return None
+    lookback = candles[-6:-1]
+    recent_high = max(c["high"] for c in lookback)
+    recent_low  = min(c["low"]  for c in lookback)
+    prev, last = candles[-2], candles[-1]
+    if prev["high"] > recent_high and last["close"] < prev["close"]: return "BEARISH"
+    elif prev["low"] < recent_low and last["close"] > prev["close"]: return "BULLISH"
+    return None
+
+def detect_bos(candles):
+    if len(candles) < SWING_LOOKBACK * 2 + 1: return None
+    recent = candles[-(SWING_LOOKBACK * 2 + 1):-1]
+    swing_high = max(c["high"] for c in recent)
+    swing_low  = min(c["low"]  for c in recent)
+    last_close = candles[-1]["close"]
+    if last_close > swing_high:  return "BULLISH"
+    elif last_close < swing_low: return "BEARISH"
+    return None
+
+def detect_fvg(candles):
+    if len(candles) < 3: return None
+    c1, c3 = candles[-3], candles[-1]
+    if c1["high"] < c3["low"]:   return "BULLISH"
+    elif c1["low"] > c3["high"]: return "BEARISH"
+    return None
+
+def get_trend(candles):
+    if len(candles) < 5: return None
+    closes = [c["close"] for c in candles[-5:]]
+    if closes[-1] > closes[0]: return "BULLISH"
+    elif closes[-1] < closes[0]: return "BEARISH"
+    return "NEUTRAL"
+
+# ─────────────────────────────────────────
+# ZONES
+# ─────────────────────────────────────────
+def find_zones(candles, lookback=ZONE_LOOKBACK):
+    if len(candles) < 10:
+        return None, None, None, None
+    recent = candles[-lookback:] if len(candles) >= lookback else candles
+    highs = [c["high"] for c in recent]
+    lows  = [c["low"]  for c in recent]
+    sorted_highs = sorted(highs, reverse=True)
+    resistance = round(sum(sorted_highs[:max(2, len(sorted_highs)//5)]) / max(2, len(sorted_highs)//5), 2)
+    sorted_lows = sorted(lows)
+    support = round(sum(sorted_lows[:max(2, len(sorted_lows)//5)]) / max(2, len(sorted_lows)//5), 2)
+    demand_zone = None
+    for i in range(len(recent) - 4, 2, -1):
+        block = recent[i-3:i]; push = recent[i]
+        block_range = max(c["high"] for c in block) - min(c["low"] for c in block)
+        avg_range = sum(c["high"] - c["low"] for c in recent) / len(recent)
+        if block_range < avg_range * 0.8 and push["close"] > max(c["high"] for c in block):
+            demand_zone = round(min(c["low"] for c in block), 2); break
+    supply_zone = None
+    for i in range(len(recent) - 4, 2, -1):
+        block = recent[i-3:i]; push = recent[i]
+        block_range = max(c["high"] for c in block) - min(c["low"] for c in block)
+        avg_range = sum(c["high"] - c["low"] for c in recent) / len(recent)
+        if block_range < avg_range * 0.8 and push["close"] < min(c["low"] for c in block):
+            supply_zone = round(max(c["high"] for c in block), 2); break
+    return support, resistance, demand_zone, supply_zone
+
+# ─────────────────────────────────────────
+# MULTI-TIMEFRAME ANALYSIS
+# ─────────────────────────────────────────
+def analyze_all_timeframes(price):
+    liq_15m = detect_liquidity(candles_15m); bos_15m = detect_bos(candles_15m); fvg_15m = detect_fvg(candles_15m)
+    liq_1h  = detect_liquidity(candles_1h);  bos_1h  = detect_bos(candles_1h);  fvg_1h  = detect_fvg(candles_1h)
+    liq_4h  = detect_liquidity(candles_4h);  bos_4h  = detect_bos(candles_4h);  fvg_4h  = detect_fvg(candles_4h)
+    trend_15m = get_trend(candles_15m); trend_1h = get_trend(candles_1h); trend_4h = get_trend(candles_4h)
+    buy_15m  = sum([liq_15m=="BULLISH", bos_15m=="BULLISH", fvg_15m=="BULLISH"])
+    sell_15m = sum([liq_15m=="BEARISH", bos_15m=="BEARISH", fvg_15m=="BEARISH"])
+    buy_1h   = sum([liq_1h=="BULLISH",  bos_1h=="BULLISH",  fvg_1h=="BULLISH"])
+    sell_1h  = sum([liq_1h=="BEARISH",  bos_1h=="BEARISH",  fvg_1h=="BEARISH"])
+    buy_4h   = sum([liq_4h=="BULLISH",  bos_4h=="BULLISH",  fvg_4h=="BULLISH"])
+    sell_4h  = sum([liq_4h=="BEARISH",  bos_4h=="BEARISH",  fvg_4h=="BEARISH"])
+    total_buy, total_sell = buy_15m+buy_1h+buy_4h, sell_15m+sell_1h+sell_4h
+    if total_buy < 1 and total_sell < 1:
+        return "HOLD", None, None, trend_15m, trend_1h, trend_4h
+    direction = "BUY" if total_buy > total_sell else "SELL"
+    tf_count = sum([buy_15m>=2, buy_1h>=2, buy_4h>=2]) if direction=="BUY" else sum([sell_15m>=2, sell_1h>=2, sell_4h>=2])
+    trade_type = "SWING" if tf_count==3 else ("DAY" if tf_count==2 else "SCALP")
+    return direction, trade_type, tf_count, trend_15m, trend_1h, trend_4h
+
+def analyze_zone_signal(price):
+    support, resistance, demand, supply = find_zones(candles_1h)
+    if demand is not None and abs(price - demand) <= ZONE_TOLERANCE:
+        return "BUY", demand, support, resistance, demand, supply
+    if supply is not None and abs(price - supply) <= ZONE_TOLERANCE:
+        return "SELL", supply, support, resistance, demand, supply
+    return None, None, support, resistance, demand, supply
+
+# ─────────────────────────────────────────
+# TRADE LOG
+# ─────────────────────────────────────────
+trade_log = []
+
+def log_trade(strategy, direction, entry, exit_price, result):
+    pnl = round(exit_price - entry, 2) if direction == "BUY" else round(entry - exit_price, 2)
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "strategy": strategy, "direction": direction,
+        "entry": entry, "exit": exit_price, "result": result, "pnl": pnl,
+    }
+    trade_log.append(record)
+    try:
+        write_header = not os.path.exists(TRADE_LOG_FILE)
+        with open(TRADE_LOG_FILE, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=record.keys())
+            if write_header: writer.writeheader()
+            writer.writerow(record)
+    except Exception as e:
+        print(f"Trade log write error: {e}")
+
+def send_weekly_summary():
+    cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+    week_trades = [t for t in trade_log if datetime.fromisoformat(t["timestamp"]) >= cutoff]
+    if not week_trades:
+        send_telegram("WEEKLY SUMMARY\nNo trades closed in the last 7 days.")
+        return
+    total = len(week_trades)
+    wins = sum(1 for t in week_trades if t["result"] == "WIN")
+    win_rate = round(wins / total * 100, 1)
+    total_pnl = round(sum(t["pnl"] for t in week_trades), 2)
+    by_strategy = {}
+    for t in week_trades:
+        s = t["strategy"]
+        by_strategy.setdefault(s, {"total": 0, "wins": 0, "pnl": 0.0})
+        by_strategy[s]["total"] += 1
+        by_strategy[s]["pnl"] += t["pnl"]
+        if t["result"] == "WIN": by_strategy[s]["wins"] += 1
+    strategy_text = ""
+    for s, d in by_strategy.items():
+        rate = round(d["wins"] / d["total"] * 100, 1)
+        strategy_text += f"{s}: {d['wins']}/{d['total']} wins ({rate}%) | ${d['pnl']:,.2f}\n"
+    send_telegram(
+        f"WEEKLY SUMMARY (last 7 days)\n-------------------\n"
+        f"Total Trades: {total}\nWins: {wins} | Losses: {total-wins}\n"
+        f"Win Rate: {win_rate}%\nNet Result: ${total_pnl:,.2f}\n"
+        f"-------------------\n{strategy_text}-------------------\n"
+        f"Note: stats reset if bot restarts."
+    )
+
+# ─────────────────────────────────────────
+# TRADE STATE
+# ─────────────────────────────────────────
+def new_trade_state():
+    return {"in_trade": False, "trade_type": None, "entry": None, "tp": None, "sl": None, "last_signal": None}
+
+def check_tp_sl(name, state, last_high, last_low, now):
+    if not state["in_trade"]: return
+    if state["trade_type"] == "BUY":
+        tp_hit = last_high >= state["tp"]; sl_hit = last_low <= state["sl"]
+        if tp_hit and sl_hit:
+            candle_bullish = last_high - state["entry"] >= state["entry"] - last_low
+            if candle_bullish:
+                send_telegram(f"[{name}] TAKE PROFIT HIT!\nEntry: ${state['entry']:,.2f}\nExit: ${state['tp']:,.2f}\nTime: {now}")
+                log_trade(name, "BUY", state["entry"], state["tp"], "WIN")
+            else:
+                send_telegram(f"[{name}] STOP LOSS HIT!\nEntry: ${state['entry']:,.2f}\nExit: ${state['sl']:,.2f}\nTime: {now}")
+                log_trade(name, "BUY", state["entry"], state["sl"], "LOSS")
+            state["in_trade"] = False
+        elif tp_hit:
+            send_telegram(f"[{name}] TAKE PROFIT HIT!\nEntry: ${state['entry']:,.2f}\nExit: ${state['tp']:,.2f}\nTime: {now}")
+            log_trade(name, "BUY", state["entry"], state["tp"], "WIN"); state["in_trade"] = False
+        elif sl_hit:
+            send_telegram(f"[{name}] STOP LOSS HIT!\nEntry: ${state['entry']:,.2f}\nExit: ${state['sl']:,.2f}\nTime: {now}")
+            log_trade(name, "BUY", state["entry"], state["sl"], "LOSS"); state["in_trade"] = False
+    elif state["trade_type"] == "SELL":
+        tp_hit = last_low <= state["tp"]; sl_hit = last_high >= state["sl"]
+        if tp_hit and sl_hit:
+            candle_bearish = state["entry"] - last_low >= last_high - state["entry"]
+            if candle_bearish:
+                send_telegram(f"[{name}] TAKE PROFIT HIT!\nEntry: ${state['entry']:,.2f}\nExit: ${state['tp']:,.2f}\nTime: {now}")
+                log_trade(name, "SELL", state["entry"], state["tp"], "WIN")
+            else:
+                send_telegram(f"[{name}] STOP LOSS HIT!\nEntry: ${state['entry']:,.2f}\nExit: ${state['sl']:,.2f}\nTime: {now}")
+                log_trade(name, "SELL", state["entry"], state["sl"], "LOSS")
+            state["in_trade"] = False
+        elif tp_hit:
+            send_telegram(f"[{name}] TAKE PROFIT HIT!\nEntry: ${state['entry']:,.2f}\nExit: ${state['tp']:,.2f}\nTime: {now}")
+            log_trade(name, "SELL", state["entry"], state["tp"], "WIN"); state["in_trade"] = False
+        elif sl_hit:
+            send_telegram(f"[{name}] STOP LOSS HIT!\nEntry: ${state['entry']:,.2f}\nExit: ${state['sl']:,.2f}\nTime: {now}")
+            log_trade(name, "SELL", state["entry"], state["sl"], "LOSS"); state["in_trade"] = False
+
+# ─────────────────────────────────────────
+# METAAPI — STREAMING CONNECTION (instant trades)
+# ─────────────────────────────────────────
+_connection1 = None
+_connection2 = None
+_symbol      = "XAUUSD"
+
+async def setup_account(api, login, password, magic):
+    accounts = await api.metatrader_account_api.get_accounts_with_infinite_scroll_pagination()
+    account = next((a for a in accounts if str(a.login) == str(login)), None)
+    if account is None:
+        account = await api.metatrader_account_api.create_account({
+            'name': f'Edgar Gold Bot {login}', 'type': 'cloud',
+            'login': login, 'password': password,
+            'server': MT_SERVER, 'platform': 'mt5', 'magic': magic
+        })
+    if account.state not in ['DEPLOYED', 'DEPLOYING']:
+        await account.deploy()
+        await account.wait_deployed()
+    conn = account.get_streaming_connection()
+    await conn.connect()
+    await conn.wait_synchronized()
+    return conn
+
+async def init_metaapi():
+    global _connection1, _connection2, _symbol
+    try:
+        from metaapi_cloud_sdk import MetaApi
+        api = MetaApi(METAAPI_TOKEN, {'region': 'london'})
+        _connection1 = await setup_account(api, MT_LOGIN, MT_PASSWORD, 123456)
+        print("Account 1 streaming connected.")
+        if MT_LOGIN2:
+            _connection2 = await setup_account(api, MT_LOGIN2, MT_PASSWORD2, 123457)
+            print("Account 2 streaming connected.")
+        send_telegram("MetaAPI streaming connected. Bot ready to trade instantly!")
+        return True
+    except Exception as e:
+        print(f"MetaAPI init error: {e}")
+        send_telegram(f"MetaAPI connection failed: {e}\nRunning in signal-only mode.")
+        return False
+
+async def place_orders(connection, signal, lot, tp, sl, orders):
+    placed = 0
+    for _ in range(orders):
+        try:
+            if signal == "BUY":
+                await connection.create_market_buy_order(_symbol, lot, stop_loss=sl, take_profit=tp)
+            else:
+                await connection.create_market_sell_order(_symbol, lot, stop_loss=sl, take_profit=tp)
+            placed += 1
+        except Exception as e:
+            print(f"Order failed: {e}")
+    return placed
+
+# ─────────────────────────────────────────
+# FRIDAY HEDGE
+# ─────────────────────────────────────────
+async def friday_close_hedge(price):
+    now = datetime.now().strftime("%H:%M:%S")
+    if len(candles_15m) >= 5:
+        ranges = [c["high"]-c["low"] for c in candles_15m[-5:]]
+        avg_range = sum(ranges)/len(ranges)
+        if avg_range > 15:
+            send_telegram(f"FRIDAY WARNING!\nToo volatile - SKIP!\nRange: ${avg_range:,.2f}\nTime: {now}")
+            return
+    buy_sl  = round(price - 5, 2)
+    sell_sl = round(price + 5, 2)
+    buy_placed  = await place_orders(_connection1, "BUY",  0.05, 0, buy_sl,  1) if _connection1 else 0
+    sell_placed = await place_orders(_connection2, "SELL", 0.05, 0, sell_sl, 1) if _connection2 else 0
+    send_telegram(
+        f"FRIDAY HEDGE PLACED! (5s to close)\n"
+        f"Gold: ${price:,.2f}\n-------------------\n"
+        f"ACC1 BUY @ ${price:,.2f} | SL: ${buy_sl:,.2f} — {'✅' if buy_placed else '❌'}\n"
+        f"ACC2 SELL @ ${price:,.2f} | SL: ${sell_sl:,.2f} — {'✅' if sell_placed else '❌'}\n"
+        f"-------------------\nCheck Monday 1AM Nairobi!\nTime: {now}"
+    )
+
+# ─────────────────────────────────────────
+# MAIN ASYNC LOOP
+# ─────────────────────────────────────────
+async def main():
+    print("Edgar's Multi-Position Auto-Trading Gold Bot Started!")
+    send_telegram(
+        "Hello Edgar!\n"
+        "Multi-Position Auto-Trading Bot is LIVE!\n"
+        "Running 3 INDEPENDENT strategies:\n"
+        "1. SMC Signal - Liquidity + BOS + FVG (15m/1h/4h)\n"
+        "2. Zone Signal - Demand/Supply zone reaction\n"
+        "3. Friday Hedge - Auto BUY+SELL at 21:59:55 UTC\n"
+        f"Trades placed AUTOMATICALLY! ({ORDERS_PER_SIGNAL} orders/signal)\n"
+        f"Account: {MT_LOGIN} ({MT_SERVER})\n"
+        "Sessions: Tokyo + London + New York"
+    )
+
+    await init_metaapi()
+
+    smc_state  = new_trade_state()
+    zone_state = new_trade_state()
+    last_session_notified = None
+    last_weekly_summary   = None
+    friday_hedge_fired    = False
+
+    while True:
+        now = datetime.now().strftime("%H:%M:%S")
+        utc_now = datetime.now(timezone.utc)
+        trading, session_name = is_trading_session()
+
+        # ── FRIDAY TIGHT LOOP ──
+        if is_friday() and utc_now.hour == 21 and utc_now.minute >= 55:
+            print("[FRIDAY] Entering tight loop...")
+            friday_hedge_fired = False
+            while True:
+                utc_now = datetime.now(timezone.utc)
+                if utc_now.hour == 22:
+                    print("[FRIDAY] Market closed.")
+                    break
+                if not friday_hedge_fired and utc_now.hour == 21 and utc_now.minute == 59 and utc_now.second >= 55:
+                    price = get_gold_price()
+                    if price:
+                        await friday_close_hedge(price)
+                    friday_hedge_fired = True
+                await asyncio.sleep(1)
+
+        # ── WEEKLY SUMMARY ──
+        if utc_now.weekday() == WEEKLY_SUMMARY_WEEKDAY and utc_now.hour >= WEEKLY_SUMMARY_HOUR:
+            week_key = utc_now.isocalendar()[:2]
+            if last_weekly_summary != week_key:
+                send_weekly_summary()
+                last_weekly_summary = week_key
+
+        # ── PRICE + CANDLES ──
+        price = get_gold_price()
+        if price:
+            build_candles(price)
+            print(f"[{now}] Gold: ${price:,.2f} | 15m:{len(candles_15m)} 1h:{len(candles_1h)} 4h:{len(candles_4h)}")
+
+        # ── SESSION NOTIFICATIONS ──
+        if trading and session_name != last_session_notified:
+            send_telegram(f"Session Open! {session_name} active\nScanning 15min+1hr+4hr...")
+            last_session_notified = session_name
+        if not trading and last_session_notified is not None:
+            send_telegram("Sessions Closed! Bot resumes next session.")
+            last_session_notified = None
+
+        if not trading or not price or len(candles_15m) < 5:
+            await asyncio.sleep(CHECK_EVERY)
+            continue
+
+        last_high = candles_15m[-1]["high"]
+        last_low  = candles_15m[-1]["low"]
+
+        # ── CHECK TP/SL ──
+        check_tp_sl("SMC",  smc_state,  last_high, last_low, now)
+        check_tp_sl("ZONE", zone_state, last_high, last_low, now)
+
+        # ── SMC SIGNAL ──
+        if not smc_state["in_trade"]:
+            direction, t_type, tf_count, t15, t1h, t4h = analyze_all_timeframes(price)
+            print(f"[SMC] Direction: {direction} | Type: {t_type} | TF: {tf_count}")
+            if direction in ["BUY","SELL"] and direction != smc_state["last_signal"]:
+                settings = TRADE_SETTINGS[t_type]
+                smc_state["entry"] = price
+                smc_state["tp"] = round(price + settings["tp"], 2) if direction=="BUY" else round(price - settings["tp"], 2)
+                smc_state["sl"] = round(price - settings["sl"], 2) if direction=="BUY" else round(price + settings["sl"], 2)
+                smc_state["trade_type"] = direction
+                smc_state["in_trade"]   = True
+                smc_state["last_signal"] = direction
+                support, resistance, demand, supply = find_zones(candles_1h)
+                zones_text = ""
+                if support:    zones_text += f"Support:    ${support:,.2f}\n"
+                if resistance: zones_text += f"Resistance: ${resistance:,.2f}\n"
+                if demand:     zones_text += f"Demand Zone: ${demand:,.2f}\n"
+                if supply:     zones_text += f"Supply Zone: ${supply:,.2f}\n"
+                if not zones_text: zones_text = "Not enough data yet\n"
+                if AUTO_TRADE and _connection1:
+                    placed = await place_orders(_connection1, direction, settings["lot"], smc_state["tp"], smc_state["sl"], ORDERS_PER_SIGNAL)
+                    send_telegram(
+                        f"[SMC] NEW SIGNAL - {direction} ({settings['label']})\n"
+                        f"Entry: ${smc_state['entry']:,.2f}\n"
+                        f"TP: ${smc_state['tp']:,.2f}\nSL: ${smc_state['sl']:,.2f}\n"
+                        f"Lot: {settings['lot']}\nTimeframes aligned: {tf_count}/3\n"
+                        f"-------------------\n{zones_text}-------------------\n"
+                        f"Time: {now}\n"
+                        f"{'✅ ' + str(placed) + '/' + str(ORDERS_PER_SIGNAL) + ' ORDERS PLACED!' if placed else '❌ Auto-trade failed - place manually!'}"
+                    )
+                else:
+                    send_telegram(
+                        f"[SMC] NEW SIGNAL - {direction} ({settings['label']})\n"
+                        f"Entry: ${smc_state['entry']:,.2f}\n"
+                        f"TP: ${smc_state['tp']:,.2f}\nSL: ${smc_state['sl']:,.2f}\n"
+                        f"Lot: {settings['lot']}\nTimeframes aligned: {tf_count}/3\n"
+                        f"-------------------\n{zones_text}-------------------\n"
+                        f"Signal only mode - place manually!\nTime: {now}"
+                    )
+
+        # ── ZONE SIGNAL ──
+        if not zone_state["in_trade"]:
+            z_direction, z_level, support, resistance, demand, supply = analyze_zone_signal(price)
+            print(f"[ZONE] Direction: {z_direction} | Level: {z_level}")
+            if z_direction in ["BUY","SELL"] and z_direction != zone_state["last_signal"]:
+                settings = TRADE_SETTINGS["ZONE"]
+                zone_state["entry"] = price
+                zone_state["tp"] = round(price + settings["tp"], 2) if z_direction=="BUY" else round(price - settings["tp"], 2)
+                zone_state["sl"] = round(price - settings["sl"], 2) if z_direction=="BUY" else round(price + settings["sl"], 2)
+                zone_state["trade_type"]  = z_direction
+                zone_state["in_trade"]    = True
+                zone_state["last_signal"] = z_direction
+                if AUTO_TRADE and _connection1:
+                    placed = await place_orders(_connection1, z_direction, settings["lot"], zone_state["tp"], zone_state["sl"], ORDERS_PER_SIGNAL)
+                    send_telegram(
+                        f"[ZONE] NEW SIGNAL - {z_direction} (Reacted off ${z_level:,.2f})\n"
+                        f"Entry: ${zone_state['entry']:,.2f}\n"
+                        f"TP: ${zone_state['tp']:,.2f}\nSL: ${zone_state['sl']:,.2f}\n"
+                        f"Lot: {settings['lot']}\nTime: {now}\n"
+                        f"{'✅ ' + str(placed) + '/' + str(ORDERS_PER_SIGNAL) + ' ORDERS PLACED!' if placed else '❌ Auto-trade failed - place manually!'}"
+                    )
+                else:
+                    send_telegram(
+                        f"[ZONE] NEW SIGNAL - {z_direction} (Reacted off ${z_level:,.2f})\n"
+                        f"Entry: ${zone_state['entry']:,.2f}\n"
+                        f"TP: ${zone_state['tp']:,.2f}\nSL: ${zone_state['sl']:,.2f}\n"
+                        f"Lot: {settings['lot']}\nSignal only mode - place manually!\nTime: {now}"
+                    )
+
+        await asyncio.sleep(CHECK_EVERY)
+
+if __name__ == "__main__":
+    asyncio.run(main())
